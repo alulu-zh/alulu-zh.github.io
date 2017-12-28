@@ -1,0 +1,142 @@
+# JAVA类中静态变量互相不可见问题的排查
+
+### 摘要
+前一段时间，我们的spring web工程中引入sharding-jdbc过程中，在IDE调试过程中，发现工程中一个工具类分别在spring和sharding-jdbc中被加载，但是该工具类中的静态变量竟然互相不可见，经过一系列排查，发现根本原因是spring-boot-devtools引入的RestartClassLoader和系统类加载器AppClassLoader分别加载工具类造成的。因为spring-boot-devtools在生产环境下会失效，所以上述问题只会出现在IDE调试过程中。
+
+### 问题描述
++ 我们的spring web工程中为了增加数据库分库分表的特性，需要引入[sharding-jdbc](https://github.com/shardingjdbc/sharding-jdbc)依赖；
++ sharding-jdbc允许我们自定义一个分表策略，只要我们在spring web工程中实现sharding-jdbc中接口PreciseShardingAlgorithm
+
+	```java
+	public interface PreciseShardingAlgorithm<T extends Comparable<?>> extends ShardingAlgorithm {
+	    String doSharding(Collection<String> availableTargetNames, PreciseShardingValue<T> shardingValue);
+	}
+	```
++ 我们在spring web工程中的PreciseShardingAlgorithm实现类是MyPreciseShardingAlgorithm，由于sharding-jdbc是通过Class.forName的方式实例化MyPreciseShardingAlgorithm，所以该类并没有注册到spring ioc容器中
+
+	```java
+	public static <T extends ShardingAlgorithm> T newInstance(final String shardingAlgorithmClassName, final Class<T> superShardingAlgorithmClass) {
+	      Class<?> result = Class.forName(shardingAlgorithmClassName);      
+	      return (T) result.newInstance();
+	  }
+	```
++ MyPreciseShardingAlgorithm的doSharding算法需要用到当前分表的总数目，为了动态获取当前分表的总数目，我们在Spring配置文件中配置了当前分表的总数目，但是MyPreciseShardingAlgorithm并没有注册在spring ioc容器，所以我们又写了一个工具类SpringContextUtil，可以在spring web工程启动后，将Spring Environment对象初始化到工具类的静态对象中，这也是处理非spring管理对象获取spring bean的一种常用方式
+
+	```java
+	@Service
+	public class SpringContextUtil implements ApplicationContextAware {
+	    private static ApplicationContext applicationContext;
+	    private static Environment environment;
+	    
+	    @Override
+	    public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+	    if (null != applicationContext) {
+	            SpringContextUtil.applicationContext = applicationContext;
+	            SpringContextUtil.environment = applicationContext.getEnvironment();
+	        }
+	    }
+	}
+	```
++ SpringContextUtil在spring启动后已经被初始化了，其在spring web工程中工作地很好，但是MyPreciseShardingAlgorithm从SpringContextUtil类中获取Environment对象却总是null。
+
+### 问题排查过程
+思路1：JAVA中出现同一个变量值不一致的现象，一般都是出现在多线程并发场景下，一般通过synchronized，volatile可以解决缓存一致性问题。
+
++ 我们尝试在SpringContextUtil类中加入synchronized方法，静态变量加上volatile关键字，但是问题依然没有解决；
++ 重温JAVA关键字synchronized和volatile的基本知识：synchronized是一种同步锁，可以让一段代码块同时只有一个线程能够访问，一般我们通过synchronized和Lock保证代码块的原子性，可见性和有序性；volatile一般用在保证共享变量的可见性的场景下，当一个共享变量被volatile修饰时，它会保证修改的值会立即被更新到主存，当有其他线程需要读取时，它会去内存中读取新值，并且volatile可以保证一定的有序性；
++ 我们问题并不是一个多线程并发的场景，SpringContextUtil在spring启动后已经初始化完成了，后续environment也不会更新，所以增加synchronized，volatile关键字并不能解决问题。
+
+思路2：类静态变量共享的，现在出现不可见问题，有可能是JVM加载了该类两次造成的。JVM在判定两个class是否相同时，不仅要判断两个类名是否相同，而且要判断是否由同一个类加载器实例加载的。只有两者同时满足的情况下，JVM才认为这两个class是相同的。即使同一份class字节码，被不同类加载器加载，JVM也会认为是两个不同的类，那么该类的静态变量必然也是无法共享的。
+
++ 我们在代码里分别打印MyPreciseShardingAlgorithm和其他地方引用SpringContextUtil类时，其当前的class loader
+
+	```
+	SpringContextUtil class loarder:
+	in MyPreciseShardingAlgorithm: 
+	name: sun.misc.Launcher$AppClassLoader
+	url_path:
+	/Library/Java/JavaVirtualMachines/jdk1.8.0_152.jdk/Contents/Home/jre/lib/charsets.jar 
+	...
+	/Users/zhouhu/workspace/mypro/mytest/mypro1/target/classes/
+   ...
+   /Users/zhouhu/.m2/repository/org/springframework/boot/spring-boot-starter/1.5.8.RELEASE/spring-boot-starter-1.5.8.RELEASE.jar
+
+	in other class:
+	name: org.springframework.boot.devtools.restart.classloader.RestartClassLoader
+	url_path:
+	/Users/zhouhu/workspace/mypro/mytest/mypro1/target/classes/
+	```
+	
++ 至此问题的原因基本清楚了，由于SpringContextUtil在当前工程的target/classes路径下，而且RestartClassLoader和AppClassLoader都包含了当前工程的target/classes路径，所以RestartClassLoader和AppClassLoader可以分别加载SpringContextUtil，MyPreciseShardingAlgorithm使用的是AppClassLoader加载的类，而其他地方使用的是RestartClassLoader加载的类，所以它们的静态变量Environment是互相不可见。
+
+### 新的问题
+再次观察这个问题，仍然有不清楚的地方：RestartClassLoader是什么类加载器，为什么MyPreciseShardingAlgorithm会使用AppClassLoader加载引用类，而其他地方使用RestartClassLoader？
+
+问题1：RestartClassLoader是什么类加载器，RestartClassLoader和AppClassLoader如何分工？
+
++ 检查引入RestartClassLoader的maven依赖，我们发现RestartClassLoader是spring-boot-devtools引入的；
++ 根据[spring-boot-devtools文档](https://docs.spring.io/spring-boot/docs/current/reference/html/using-boot-devtools.html)，spring-boot-devtools实现了java的热重启，在IDE中修改java文件，spring会快速重启；
++ spring-boot-devtools的实现方式可以简化为所有当前开发的文件都会被一个特殊类加载器RestartClassLoader加载，RestartClassLoader实现了监控当前开发的文件，并在文件修改后重新加载的功能；而其他jar中的类都会被RestartClassLoader的parent类加载器AppClassLoader加载，每次重启的时候AppClassLoader和其父类加载器加载的类都不会重新加载；这样spring-boot-devtools就实现了对当前开发文件的热重启；
++ 分析我们之前的场景，sharding-jdbc是第三方依赖，不属于当前开发的java文件，所以java的系统类加载器AppClassLoader负责加载sharding-jdbc所有类以及类中引用的其他类，又因为MyPreciseShardingAlgorithm是在sharding-jdbc相关类中通过Class.forName方式实例化的，所以这里的MyPreciseShardingAlgorithm及其引用的SpringContextUtil也是通过AppClassLoader加载；另一方面，我们在spring web工程中某个类中引用SpringContextUtil，因为SpringContextUtil就是当前开发的文件，当然是通过RestartClassLoader来加载。
+
+至此清楚了RestartClassLoader和AppClassLoader的分工，但是我们也注意到AppClassLoader其实是RestartClassLoader的parent class loader，重温java classloader的基本知识，我们一般认为classloader都是采用双亲委派的方式来加载class，这样可以避免重复加载，如果RestartClassLoader也采用双亲委派的方式，AppClassLoader加载过的SpringContextUtil，为什么会在RestartClassLoader被重复加载呢？
+
+问题 2：RestartClassLoader加载类的策略什么？
+
++ 先上双亲委派的方式的类加载器示意图
+![](https://raw.githubusercontent.com/alulu-zh/alulu-zh.github.io/master/old_classloader.png)
+
++ 我们直接看RestartClassLoader的源码，可以发现加载类的loadClass方法并没有采用双亲委派的模式，而是先是看看自己有没有加载过这个类，如果没有就自己加载看看，如果在url path（即当前工程的target/classes路径）中没有发现class，RestartClassLoader才会委托父类加载器加载
+
+	```java
+	public Class<?> loadClass(String name, boolean resolve)
+				throws ClassNotFoundException {
+			//remove
+			Class<?> loadedClass = findLoadedClass(name);
+			if (loadedClass == null) {
+				try {
+					loadedClass = findClass(name);
+				}
+				catch (ClassNotFoundException ex) {
+					loadedClass = getParent().loadClass(name);
+				}
+			}
+			//remove
+			return loadedClass;
+		}
+	```
+
++ 结合之前实验的观察，RestartClassLoader的url path默认是当前工程的target/classes路径，这个path同样也是其父类加载器AppClassLoader的url path，这也解释了为什么RestartClassLoader不采用双亲委派的方式加载类，因为如果RestartClassLoader采用双亲委派的方式，所有target/classes下面的类都会优先被AppClassLoader加载，这样RestartClassLoader的热重启作用就会失效。
+
+### 如何解决
+虽然我们排查清楚上述问题发生的原因，但是我们还没有解决这个问题。如果让我解决，我想应该增加一个配置，可以让我们动态配置RestartClassLoader的url path，如果我们把sharding-jdbc的jar包路径加入RestartClassLoader的url path，sharding-jdbc所有类及其相关的MyPreciseShardingAlgorithm和SpringContextUtil都会被RestartClassLoader加载，同时工程的其他类中引用SpringContextUtil都是由RestartClassLoader触发，这样就避免了SpringContextUtil被不同的类加载器加载的问题。
+
++ google了一下spring-boot-devtools的RestartClassLoader，发现已经有一个[issue 3316](https://github.com/spring-projects/spring-boot/issues/3316)发现了类似问题，并且该issue已经fix。
++ springboot给出的解决方案和我上面的提案类似，具体做法是在resources目录下新建META-INF/spring-devtools.properties，并在properties文件里面加上我们需要include/exclude的path pattern
+   
+	```
+	restart.include.some_include_path_pattern=/io/shardingjdbc
+	restart.exclude.some_exclude_path_pattern=/redis/clients/jedis
+	```
++ 在我们的代码里加入spring-devtools.properties，问题解决
+
+   ```
+	SpringContextUtil class loarder:
+	in MyPreciseShardingAlgorithm: 
+	name: org.springframework.boot.devtools.restart.classloader.RestartClassLoader
+	url_path:
+	/Users/zhouhu/workspace/mypro/mytest/mypro1/target/classes/
+   /Users/zhouhu/.m2/repository/io/shardingjdbc/sharding-jdbc/2.0.0.M3/sharding-jdbc-2.0.0.M3.jar
+   
+	in other class:
+	name: org.springframework.boot.devtools.restart.classloader.RestartClassLoader
+	url_path:
+	/Users/zhouhu/workspace/mypro/mytest/mypro1/target/classes/
+	/Users/zhouhu/.m2/repository/io/shardingjdbc/sharding-jdbc/2.0.0.M3/sharding-jdbc-2.0.0.M3.jar
+	```
+   
+### 问题总结
++ 出现共享变量值不同步的问题，大体思路就是先看是不是多线程并发造成的缓存不一致问题，然后看看是不是不同类加载器同时加载造成的；
++ 在使用spring-boot-devtools情况下，如果第三方依赖需要使用当前工程的类，一定需要把第三方工程的jar包路径加入RestartClassLoader的url path；
++ 工程中引入新的依赖，先看看文档和issue :)
+ 
