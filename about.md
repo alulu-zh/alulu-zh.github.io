@@ -4,12 +4,8 @@ title: About
 permalink: /about/
 ---
 
-Some information about you!
-
-### More Information
-
-A place to include any other types of information that you'd like to include about yourself.
+我是周琥，是一名java工程师，现在就职于好未来教育集团。
 
 ### Contact me
 
-[email@domain.com](mailto:email@domain.com)
+[zhouhu690109@163.com](mailto:zhouhu690109@163.com)
